@@ -1,0 +1,923 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFront Abuse Detection System - Multi-Lambda parallel processing architecture
+  for monitoring CloudFront traffic across 270+ AWS accounts in an Organization.
+  Scheduler Lambda orchestrates Worker Lambdas to process accounts in parallel.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Telegram Configuration"
+        Parameters:
+          - TelegramBotToken
+          - TelegramChatId
+      - Label:
+          default: "Lambda Code Location"
+        Parameters:
+          - S3Bucket
+          - S3Key
+      - Label:
+          default: "Processing Configuration"
+        Parameters:
+          - WorkerConcurrency
+          - AccountsPerWorker
+          - OrganizationAccessRole
+      - Label:
+          default: "Detection Thresholds"
+        Parameters:
+          - AbuseMultiplier
+          - DurationThreshold
+          - AbsoluteRequestThreshold
+          - AbsoluteBytesThreshold
+      - Label:
+          default: "Schedule Configuration"
+        Parameters:
+          - ScheduleExpression
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaMemorySize
+          - SchedulerTimeout
+          - WorkerTimeout
+      - Label:
+          default: "VPC Configuration (Optional)"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - SecurityGroupIds
+
+Parameters:
+  # ============================================================================
+  # Telegram Configuration
+  # ============================================================================
+  TelegramBotToken:
+    Type: String
+    NoEcho: true
+    Description: >
+      Telegram Bot Token for sending alerts. 
+      This will be passed as an environment variable to the Worker Lambda.
+    AllowedPattern: ".+"
+    ConstraintDescription: TelegramBotToken cannot be empty
+
+  TelegramChatId:
+    Type: String
+    Description: >
+      Telegram Chat ID where alerts will be sent.
+      This will be passed as an environment variable to the Worker Lambda.
+    AllowedPattern: ".+"
+    ConstraintDescription: TelegramChatId cannot be empty
+
+  # ============================================================================
+  # Lambda Code Location
+  # ============================================================================
+  S3Bucket:
+    Type: String
+    Description: S3 bucket containing the Lambda deployment package
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]*[a-z0-9]$"
+    ConstraintDescription: Must be a valid S3 bucket name
+
+  S3Key:
+    Type: String
+    Description: S3 key (path) to the Lambda deployment package (e.g., lambda/deployment.zip)
+    AllowedPattern: ".+"
+    ConstraintDescription: S3Key cannot be empty
+
+  # ============================================================================
+  # Processing Configuration
+  # ============================================================================
+  OrganizationAccessRole:
+    Type: String
+    Default: OrganizationAccessRole_DO_NOT_DELETE
+    Description: >
+      IAM role name to assume in child accounts for accessing CloudFront metrics.
+      This role must exist in all child accounts.
+
+  WorkerConcurrency:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 50
+    Description: >
+      Number of Worker Lambda instances to invoke in parallel.
+      Higher values process accounts faster but increase concurrent Lambda executions.
+
+  AccountsPerWorker:
+    Type: Number
+    Default: 20
+    MinValue: 5
+    MaxValue: 100
+    Description: >
+      Number of AWS accounts each Worker Lambda will process.
+      Lower values reduce per-Worker execution time but require more Workers.
+
+  # ============================================================================
+  # Detection Thresholds
+  # ============================================================================
+  AbuseMultiplier:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 100
+    Description: >
+      Critical threshold multiplier for abuse detection.
+      Traffic exceeding (average * multiplier) triggers immediate alert.
+
+  WarningMultiplier:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 100
+    Description: >
+      Warning threshold multiplier for slow attack detection.
+      Traffic exceeding (average * multiplier) for sustained period triggers alert.
+
+  DurationThreshold:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 24
+    Description: >
+      Number of consecutive detections for Critical (3x) alerts.
+      Default 1 means immediate alert when critical threshold is exceeded.
+
+  WarningDurationThreshold:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 24
+    Description: >
+      Number of consecutive detections for Warning (2x) alerts.
+      Default 2 means alert after 30 minutes of sustained warning-level traffic.
+
+  AbsoluteRequestThreshold:
+    Type: Number
+    Default: 250000
+    MinValue: 0
+    Description: >
+      Absolute request count threshold per 15-minute window.
+      Traffic below this threshold is not flagged regardless of relative increase.
+      Default: 250,000 requests per 15 minutes (equivalent to 1M/hour).
+
+  AbsoluteBytesThreshold:
+    Type: Number
+    Default: 2684354560
+    MinValue: 0
+    Description: >
+      Absolute bytes transferred threshold per 15-minute window (default: 2.5GB).
+      Traffic below this threshold is not flagged regardless of relative increase.
+      Default: 2.5GB per 15 minutes (equivalent to 10GB/hour).
+
+  # ============================================================================
+  # Schedule Configuration
+  # ============================================================================
+  ScheduleExpression:
+    Type: String
+    Default: "rate(15 minutes)"
+    Description: >
+      EventBridge schedule expression for triggering the Scheduler Lambda.
+      Examples: "rate(15 minutes)", "rate(1 hour)", "cron(0 * * * ? *)"
+    AllowedPattern: "^(rate\\(.+\\)|cron\\(.+\\))$"
+    ConstraintDescription: Must be a valid EventBridge schedule expression (rate or cron)
+
+  # ============================================================================
+  # Lambda Configuration
+  # ============================================================================
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    MinValue: 128
+    MaxValue: 10240
+    Description: >
+      Memory size (MB) for Lambda functions.
+      Higher memory also increases CPU allocation.
+    AllowedValues:
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 3072
+      - 4096
+      - 5120
+      - 6144
+      - 7168
+      - 8192
+      - 9216
+      - 10240
+
+  SchedulerTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: >
+      Timeout (seconds) for Scheduler Lambda.
+      Should be enough to invoke all Workers (default: 5 minutes).
+
+  WorkerTimeout:
+    Type: Number
+    Default: 900
+    MinValue: 60
+    MaxValue: 900
+    Description: >
+      Timeout (seconds) for Worker Lambda.
+      Should be enough to process all assigned accounts (default: 15 minutes).
+
+  # ============================================================================
+  # VPC Configuration (Optional)
+  # ============================================================================
+  VpcId:
+    Type: String
+    Default: ""
+    Description: >
+      (Optional) VPC ID for Lambda functions.
+      Leave empty to run Lambda without VPC configuration.
+
+  SubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      (Optional) Comma-separated list of subnet IDs for Lambda functions.
+      Required if VpcId is specified. Subnets should have NAT Gateway access.
+
+  SecurityGroupIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      (Optional) Comma-separated list of security group IDs for Lambda functions.
+      Required if VpcId is specified.
+
+# ============================================================================
+# Conditions
+# ============================================================================
+Conditions:
+  HasVpcConfig: !Not [!Equals [!Ref VpcId, ""]]
+
+# ============================================================================
+# Resources
+# ============================================================================
+Resources:
+  # ==========================================================================
+  # DynamoDB Tables
+  # ==========================================================================
+  
+  # AbuseCounter Table - Stores abuse detection counters with TTL
+  AbuseCounterTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-AbuseCounter"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: CounterKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: CounterKey
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+      Tags:
+        - Key: Application
+          Value: CloudFrontAbuseDetection
+        - Key: Purpose
+          Value: AbuseCounter
+
+  # AccountsCache Table - Caches AWS Organization accounts with TTL
+  AccountsCacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-AccountsCache"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: CacheKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: CacheKey
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+      Tags:
+        - Key: Application
+          Value: CloudFrontAbuseDetection
+        - Key: Purpose
+          Value: AccountsCache
+
+  # FailedAccounts Table - Tracks failed account processing with TTL
+  FailedAccountsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-FailedAccounts"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: AccountId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: AccountId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+      Tags:
+        - Key: Application
+          Value: CloudFrontAbuseDetection
+        - Key: Purpose
+          Value: FailedAccounts
+
+  # SentAlerts Table - Tracks sent alerts for deduplication with TTL
+  SentAlertsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-SentAlerts"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: AlertKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: AlertKey
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+      Tags:
+        - Key: Application
+          Value: CloudFrontAbuseDetection
+        - Key: Purpose
+          Value: SentAlerts
+
+  # ==========================================================================
+  # Dead Letter Queue (DLQ)
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # SQS Dead Letter Queue - Captures failed Lambda invocations
+  # --------------------------------------------------------------------------
+  # Stores failed Lambda invocation events for later analysis and retry
+  # Requirements: 7.5
+  # --------------------------------------------------------------------------
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-DLQ"
+      MessageRetentionPeriod: 1209600  # 14 days (maximum retention)
+      VisibilityTimeout: 300  # 5 minutes
+      Tags:
+        - Key: Application
+          Value: CloudFrontAbuseDetection
+        - Key: Purpose
+          Value: DeadLetterQueue
+
+  # ==========================================================================
+  # IAM Roles
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # Scheduler Lambda Execution Role
+  # --------------------------------------------------------------------------
+  # Permissions:
+  # - CloudWatch Logs: Write logs
+  # - Lambda: Invoke Worker Lambda (async)
+  # - DynamoDB: Read AccountsCache table
+  # - Organizations: List accounts
+  # - VPC: Network interface management (conditional)
+  # Requirements: 2.1, 3.1, 3.2, 3.3
+  # --------------------------------------------------------------------------
+  SchedulerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-SchedulerLambdaRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Application
+          Value: CloudFrontAbuseDetection
+        - Key: Purpose
+          Value: SchedulerLambdaExecution
+
+  # Scheduler Lambda - CloudWatch Logs Policy
+  SchedulerLogsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-SchedulerLogsPolicy"
+      Roles:
+        - !Ref SchedulerLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudWatchLogsAccess
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-Scheduler:*"
+
+  # Scheduler Lambda - Invoke Worker Lambda Policy (Requirement 3.1)
+  SchedulerInvokeWorkerPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-SchedulerInvokeWorkerPolicy"
+      Roles:
+        - !Ref SchedulerLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: InvokeWorkerLambda
+            Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-Worker"
+
+  # Scheduler Lambda - DynamoDB Read Policy (Requirement 3.2)
+  SchedulerDynamoDBPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-SchedulerDynamoDBPolicy"
+      Roles:
+        - !Ref SchedulerLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadAccountsCacheTable
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:Scan
+            Resource:
+              - !GetAtt AccountsCacheTable.Arn
+
+  # Scheduler Lambda - Organizations Policy (Requirement 3.3)
+  SchedulerOrganizationsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-SchedulerOrganizationsPolicy"
+      Roles:
+        - !Ref SchedulerLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ListOrganizationAccounts
+            Effect: Allow
+            Action:
+              - organizations:ListAccounts
+            Resource: "*"
+
+  # Scheduler Lambda - VPC Policy (Conditional - Requirement 3.9)
+  SchedulerVpcPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasVpcConfig
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-SchedulerVpcPolicy"
+      Roles:
+        - !Ref SchedulerLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: VpcNetworkInterfaceManagement
+            Effect: Allow
+            Action:
+              - ec2:CreateNetworkInterface
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DeleteNetworkInterface
+              - ec2:AssignPrivateIpAddresses
+              - ec2:UnassignPrivateIpAddresses
+            Resource: "*"
+
+  # Scheduler Lambda - SQS DLQ Policy (Requirement 7.5)
+  SchedulerDLQPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-SchedulerDLQPolicy"
+      Roles:
+        - !Ref SchedulerLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SendMessageToDeadLetterQueue
+            Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt DeadLetterQueue.Arn
+
+  # --------------------------------------------------------------------------
+  # Worker Lambda Execution Role
+  # --------------------------------------------------------------------------
+  # Permissions:
+  # - CloudWatch Logs: Write logs
+  # - DynamoDB: Read/Write all tables
+  # - STS: AssumeRole for cross-account access
+  # - CloudWatch: Publish metrics
+  # - VPC: Network interface management (conditional)
+  # Requirements: 2.2, 3.4, 3.5, 3.7, 3.8, 3.9
+  # Note: No Secrets Manager permissions - Telegram credentials via env vars
+  # --------------------------------------------------------------------------
+  WorkerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-WorkerLambdaRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Application
+          Value: CloudFrontAbuseDetection
+        - Key: Purpose
+          Value: WorkerLambdaExecution
+
+  # Worker Lambda - CloudWatch Logs Policy (Requirement 3.7)
+  WorkerLogsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-WorkerLogsPolicy"
+      Roles:
+        - !Ref WorkerLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudWatchLogsAccess
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-Worker:*"
+
+  # Worker Lambda - DynamoDB Read/Write Policy (Requirement 3.4)
+  WorkerDynamoDBPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-WorkerDynamoDBPolicy"
+      Roles:
+        - !Ref WorkerLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadWriteAllDynamoDBTables
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:Query
+              - dynamodb:Scan
+              - dynamodb:BatchGetItem
+              - dynamodb:BatchWriteItem
+            Resource:
+              - !GetAtt AbuseCounterTable.Arn
+              - !GetAtt AccountsCacheTable.Arn
+              - !GetAtt FailedAccountsTable.Arn
+              - !GetAtt SentAlertsTable.Arn
+
+  # Worker Lambda - STS AssumeRole Policy (Requirement 3.5)
+  WorkerAssumeRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-WorkerAssumeRolePolicy"
+      Roles:
+        - !Ref WorkerLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AssumeRoleInChildAccounts
+            Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Resource:
+              - !Sub "arn:aws:iam::*:role/${OrganizationAccessRole}"
+
+  # Worker Lambda - CloudWatch Metrics Policy (Requirement 3.8)
+  WorkerCloudWatchMetricsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-WorkerCloudWatchMetricsPolicy"
+      Roles:
+        - !Ref WorkerLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublishCloudWatchMetrics
+            Effect: Allow
+            Action:
+              - cloudwatch:PutMetricData
+            Resource: "*"
+
+  # Worker Lambda - Organizations Policy (for getting payer account ID)
+  WorkerOrganizationsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-WorkerOrganizationsPolicy"
+      Roles:
+        - !Ref WorkerLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DescribeOrganization
+            Effect: Allow
+            Action:
+              - organizations:DescribeOrganization
+            Resource: "*"
+
+  # Worker Lambda - VPC Policy (Conditional - Requirement 3.9)
+  WorkerVpcPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasVpcConfig
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-WorkerVpcPolicy"
+      Roles:
+        - !Ref WorkerLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: VpcNetworkInterfaceManagement
+            Effect: Allow
+            Action:
+              - ec2:CreateNetworkInterface
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DeleteNetworkInterface
+              - ec2:AssignPrivateIpAddresses
+              - ec2:UnassignPrivateIpAddresses
+            Resource: "*"
+
+  # Worker Lambda - SQS DLQ Policy (Requirement 7.5)
+  WorkerDLQPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-WorkerDLQPolicy"
+      Roles:
+        - !Ref WorkerLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SendMessageToDeadLetterQueue
+            Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt DeadLetterQueue.Arn
+
+  # ==========================================================================
+  # Lambda Functions
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # Scheduler Lambda Function
+  # --------------------------------------------------------------------------
+  # Orchestrates Worker Lambda invocations for parallel account processing
+  # Requirements: 2.1, 8.4, 8.5, 8.6, 8.7
+  # --------------------------------------------------------------------------
+  SchedulerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-Scheduler"
+      Description: >
+        Scheduler Lambda for CloudFront Abuse Detection System.
+        Orchestrates Worker Lambda invocations for parallel account processing.
+      Runtime: python3.12
+      Handler: scheduler_handler.lambda_handler
+      Role: !GetAtt SchedulerLambdaRole.Arn
+      Timeout: !Ref SchedulerTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Code:
+        S3Bucket: !Ref S3Bucket
+        S3Key: !Ref S3Key
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Environment:
+        Variables:
+          # Worker Lambda Configuration
+          WORKER_LAMBDA_NAME: !Sub "${AWS::StackName}-Worker"
+          ACCOUNTS_PER_WORKER: !Ref AccountsPerWorker
+          WORKER_CONCURRENCY: !Ref WorkerConcurrency
+          # AWS Configuration
+          AWS_REGION_OVERRIDE: !Ref "AWS::Region"
+          # DynamoDB Table Names
+          DDB_ACCOUNTS_CACHE_TABLE: !Ref AccountsCacheTable
+          # Organization Access
+          ORG_ACCESS_ROLE: !Ref OrganizationAccessRole
+      VpcConfig:
+        !If
+          - HasVpcConfig
+          - SubnetIds: !Ref SubnetIds
+            SecurityGroupIds: !Ref SecurityGroupIds
+          - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Application
+          Value: CloudFrontAbuseDetection
+        - Key: Purpose
+          Value: SchedulerLambda
+
+  # --------------------------------------------------------------------------
+  # Worker Lambda Function
+  # --------------------------------------------------------------------------
+  # Processes assigned accounts for abuse detection
+  # Requirements: 2.2, 2.7, 8.4, 8.5, 8.6, 8.7
+  # --------------------------------------------------------------------------
+  WorkerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-Worker"
+      Description: >
+        Worker Lambda for CloudFront Abuse Detection System.
+        Processes assigned accounts for abuse detection and sends alerts.
+      Runtime: python3.12
+      Handler: worker_handler.lambda_handler
+      Role: !GetAtt WorkerLambdaRole.Arn
+      Timeout: !Ref WorkerTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Code:
+        S3Bucket: !Ref S3Bucket
+        S3Key: !Ref S3Key
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Environment:
+        Variables:
+          # AWS Configuration
+          AWS_REGION_OVERRIDE: !Ref "AWS::Region"
+          ORG_ACCESS_ROLE: !Ref OrganizationAccessRole
+          # Telegram Configuration (passed directly as env vars)
+          TELEGRAM_BOT_TOKEN: !Ref TelegramBotToken
+          TELEGRAM_CHAT_ID: !Ref TelegramChatId
+          # DynamoDB Table Names
+          DDB_ABUSE_COUNTER_TABLE: !Ref AbuseCounterTable
+          DDB_ACCOUNTS_CACHE_TABLE: !Ref AccountsCacheTable
+          DDB_FAILED_ACCOUNTS_TABLE: !Ref FailedAccountsTable
+          DDB_SENT_ALERTS_TABLE: !Ref SentAlertsTable
+          # Detection Thresholds
+          ABUSE_MULTIPLIER: !Ref AbuseMultiplier
+          WARNING_MULTIPLIER: !Ref WarningMultiplier
+          DURATION_THRESHOLD: !Ref DurationThreshold
+          WARNING_DURATION_THRESHOLD: !Ref WarningDurationThreshold
+          MIN_REQUESTS_THRESHOLD: !Ref AbsoluteRequestThreshold
+          MIN_BYTES_THRESHOLD: !Ref AbsoluteBytesThreshold
+      VpcConfig:
+        !If
+          - HasVpcConfig
+          - SubnetIds: !Ref SubnetIds
+            SecurityGroupIds: !Ref SecurityGroupIds
+          - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Application
+          Value: CloudFrontAbuseDetection
+        - Key: Purpose
+          Value: WorkerLambda
+
+  # ==========================================================================
+  # EventBridge Rules
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # Schedule Rule - Triggers Scheduler Lambda on schedule
+  # --------------------------------------------------------------------------
+  # Triggers the Scheduler Lambda based on the configured schedule expression
+  # Requirements: 2.5
+  # --------------------------------------------------------------------------
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-ScheduleRule"
+      Description: >
+        Scheduled rule to trigger the Scheduler Lambda for CloudFront Abuse Detection.
+        Default schedule: every hour.
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: SchedulerLambdaTarget
+          Arn: !GetAtt SchedulerLambda.Arn
+
+  # --------------------------------------------------------------------------
+  # Lambda Permission for EventBridge
+  # --------------------------------------------------------------------------
+  # Allows EventBridge to invoke the Scheduler Lambda
+  # Requirements: 2.5
+  # --------------------------------------------------------------------------
+  SchedulerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SchedulerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+  # ==========================================================================
+  # DLQ Queue Policy
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # DLQ Policy - Allow Lambda service to send messages
+  # --------------------------------------------------------------------------
+  DeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref DeadLetterQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowLambdaToSendMessages
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt DeadLetterQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  - !GetAtt SchedulerLambda.Arn
+                  - !GetAtt WorkerLambda.Arn
+
+# ============================================================================
+# Outputs
+# ============================================================================
+# Outputs all created resource ARNs for reference and integration
+# Requirements: 2.9
+# ============================================================================
+Outputs:
+  # --------------------------------------------------------------------------
+  # Lambda Function ARNs
+  # --------------------------------------------------------------------------
+  SchedulerLambdaArn:
+    Description: ARN of the Scheduler Lambda function
+    Value: !GetAtt SchedulerLambda.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-SchedulerLambdaArn"
+
+  WorkerLambdaArn:
+    Description: ARN of the Worker Lambda function
+    Value: !GetAtt WorkerLambda.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkerLambdaArn"
+
+  # --------------------------------------------------------------------------
+  # DynamoDB Table ARNs
+  # --------------------------------------------------------------------------
+  AbuseCounterTableArn:
+    Description: ARN of the AbuseCounter DynamoDB table
+    Value: !GetAtt AbuseCounterTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-AbuseCounterTableArn"
+
+  AccountsCacheTableArn:
+    Description: ARN of the AccountsCache DynamoDB table
+    Value: !GetAtt AccountsCacheTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-AccountsCacheTableArn"
+
+  FailedAccountsTableArn:
+    Description: ARN of the FailedAccounts DynamoDB table
+    Value: !GetAtt FailedAccountsTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-FailedAccountsTableArn"
+
+  SentAlertsTableArn:
+    Description: ARN of the SentAlerts DynamoDB table
+    Value: !GetAtt SentAlertsTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-SentAlertsTableArn"
+
+  # --------------------------------------------------------------------------
+  # SQS Queue ARN
+  # --------------------------------------------------------------------------
+  DeadLetterQueueArn:
+    Description: ARN of the Dead Letter Queue (DLQ)
+    Value: !GetAtt DeadLetterQueue.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DeadLetterQueueArn"
+
+  # --------------------------------------------------------------------------
+  # EventBridge Rule ARN
+  # --------------------------------------------------------------------------
+  ScheduleRuleArn:
+    Description: ARN of the EventBridge Schedule Rule
+    Value: !GetAtt ScheduleRule.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ScheduleRuleArn"
+
+  # --------------------------------------------------------------------------
+  # IAM Role ARNs
+  # --------------------------------------------------------------------------
+  SchedulerLambdaRoleArn:
+    Description: ARN of the Scheduler Lambda IAM execution role
+    Value: !GetAtt SchedulerLambdaRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-SchedulerLambdaRoleArn"
+
+  WorkerLambdaRoleArn:
+    Description: ARN of the Worker Lambda IAM execution role
+    Value: !GetAtt WorkerLambdaRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkerLambdaRoleArn"
