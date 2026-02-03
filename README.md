@@ -69,13 +69,13 @@ aws cloudformation deploy \
 ## 告警示例
 
 ```
-⚠️ Payer 288425056836 ⚠️
+⚠️ Payer 282225226836 ⚠️
 🔴 Critical Alert 🔴
 ⚠️ 以下Amazon CloudFront分配疑似被盗刷（流量异常） ⚠️
 
 #CDN盗刷 #流量异常 #紧急告警 #AWS #CloudFront
 
-帐号ID | Account ID : 269552222866
+帐号ID | Account ID : 269222222866
 帐号名称 | Account Name : ANS01
 帐号电邮 | Account Email : example@gmail.com
 分配 | Distribution : E23JQVRSK3EZF7
